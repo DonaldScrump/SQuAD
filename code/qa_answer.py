@@ -4,6 +4,8 @@ from __future__ import print_function
 
 import io
 import os
+import re
+import time
 import json
 import sys
 import random
@@ -14,7 +16,7 @@ import numpy as np
 from six.moves import xrange
 import tensorflow as tf
 
-from qa_model import Encoder, QASystem, Decoder
+from qa import Encoder, QASystem, Decoder
 from preprocessing.squad_preprocess import data_from_json, maybe_download, squad_base_url, \
     invert_map, tokenize, token_idx_map
 import qa_data
@@ -25,20 +27,23 @@ logging.basicConfig(level=logging.INFO)
 
 FLAGS = tf.app.flags.FLAGS
 
-tf.app.flags.DEFINE_float("learning_rate", 0.001, "Learning rate.")
+tf.app.flags.DEFINE_float("learning_rate", 0.8, "Learning rate.")
 tf.app.flags.DEFINE_float("evaluate", 100, "Evaluating sample numbers")
-tf.app.flags.DEFINE_float("dropout", 0.15, "Fraction of units randomly dropped on non-recurrent connections.")
-tf.app.flags.DEFINE_integer("batch_size", 10, "Batch size to use during training.")
+tf.app.flags.DEFINE_float("dropout", 0.8, "Fraction of units randomly dropped on non-recurrent connections.")
+tf.app.flags.DEFINE_float("max_gradient_norm", 10.0, "Clip gradients to this norm.")
+tf.app.flags.DEFINE_integer("batch_size", 16, "Batch size to use during training.")
 tf.app.flags.DEFINE_integer("epochs", 0, "Number of epochs to train.")
-tf.app.flags.DEFINE_integer("state_size", 200, "Size of each model layer.")
+tf.app.flags.DEFINE_integer("state_size", 75, "Size of each model layer.")
 tf.app.flags.DEFINE_integer("embedding_size", 100, "Size of the pretrained vocabulary.")
 tf.app.flags.DEFINE_integer("output_size", 750, "The output size of your model.")
 tf.app.flags.DEFINE_integer("keep", 0, "How many checkpoints to keep, 0 indicates keep all.")
+tf.app.flags.DEFINE_string("optimizer", "adad", "adam / sgd / adadelta")
+tf.app.flags.DEFINE_string("data_dir", "data/squad", "SQuAD directory (default ./data/squad)")
 tf.app.flags.DEFINE_string("train_dir", "train", "Training directory (default: ./train).")
 tf.app.flags.DEFINE_string("log_dir", "log", "Path to store log and flag files (default: ./log)")
 tf.app.flags.DEFINE_string("vocab_path", "data/squad/vocab.dat", "Path to vocab file (default: ./data/squad/vocab.dat)")
 tf.app.flags.DEFINE_string("embed_path", "", "Path to the trimmed GLoVe embedding (default: ./data/squad/glove.trimmed.{embedding_size}.npz)")
-tf.app.flags.DEFINE_string("dev_path", "data/squad/dev-v1.1.json", "Path to the JSON dev set to evaluate against (default: ./data/squad/dev-v1.1.json)")
+tf.app.flags.DEFINE_string("dev_path", "download/squad/dev-v1.1.json", "Path to the JSON dev set to evaluate against (default: ./data/squad/dev-v1.1.json)")
 
 def initialize_model(session, model, train_dir):
     ckpt = tf.train.get_checkpoint_state(train_dir)
@@ -63,6 +68,37 @@ def initialize_vocab(vocab_path):
         return vocab, rev_vocab
     else:
         raise ValueError("Vocabulary file %s not found.", vocab_path)
+
+def load_file(set_id, vocab):
+    dataset = None
+
+    if tf.gfile.Exists(os.path.join(FLAGS.data_dir,set_id)+'.question'):
+        logging.info("Files found! Extracting input sentences...in data set: "+set_id)
+        start = time.time()
+        questions = []
+        contexts = []
+        answer_span = []
+
+        file_prefix = os.path.join(FLAGS.data_dir,set_id)
+        with open(file_prefix+'.question') as fin:
+            questions.extend(fin.readlines())
+        questions = [re.split(' +|/',line.strip('\n')) for line in questions]
+        questions = [[vocab[word] if vocab.get(word) is not None else 2 for word in line] for line in questions]
+
+        with open(file_prefix+'.context') as fin:
+            contexts.extend(fin.readlines())
+        contexts = [re.split(' +|/',line.strip('\n'))[:FLAGS.output_size] for line in contexts]
+        contexts = [[vocab[word] if vocab.get(word) is not None else 2 for word in line] for line in contexts]
+
+        with open(file_prefix+'.span') as fin:
+            answer_span.extend(fin.readlines())
+        answer_span = [re.findall('\d+', line) for line in answer_span]
+        answer_span = np.array([[int(l) for l in line] for line in answer_span])
+
+        dataset = zip(questions,contexts,answer_span)
+        logging.info('Took %.2f seconds', time.time() - start)
+
+    return dataset
 
 
 def read_dataset(dataset, tier, vocab):
@@ -103,7 +139,7 @@ def read_dataset(dataset, tier, vocab):
 
 def prepare_dev(prefix, dev_filename, vocab):
     # Don't check file size, since we could be using other datasets
-    dev_dataset = maybe_download(squad_base_url, dev_filename, prefix)
+    # dev_dataset = maybe_download(squad_base_url, dev_filename, prefix)
 
     dev_data = data_from_json(os.path.join(prefix, dev_filename))
     context_data, question_data, question_uuid_data = read_dataset(dev_data, 'dev', vocab)
@@ -111,7 +147,7 @@ def prepare_dev(prefix, dev_filename, vocab):
     return context_data, question_data, question_uuid_data
 
 
-def generate_answers(sess, model, dataset, rev_vocab):
+def generate_answers(sess, model, dataset, rev_vocab, uuids):
     """
     Loop over the dev or test dataset and generate answer.
 
@@ -131,6 +167,25 @@ def generate_answers(sess, model, dataset, rev_vocab):
     :return:
     """
     answers = {}
+    dev_batches = model.minibatches(dataset, FLAGS.batch_size)
+    for i in range(len(dev_batches)):
+        if i%100 == 0:
+            print(i)
+        a_s, a_e = model.answer(sess, dev_batches[i])
+        if i != len(dev_batches)-1:
+            for j in range(len(dev_batches[i])):
+                passage = dev_batches[i]['c'][j,:]
+                if a_s[j]>a_e[j]:
+                    answers[uuids[i*FLAGS.batch_size+j]] = rev_vocab[passage[a_s[j]]]
+                else:
+                    answers[uuids[i*FLAGS.batch_size+j]] = ' '.join([rev_vocab[passage[k]] for k in range(a_s[j], a_e[j] + 1)])
+        else:
+            for j in range(((len(dataset)-1)%FLAGS.batch_size)+1):
+                passage = dev_batches[i]['c'][j, :]
+                if a_s[j] > a_e[j]:
+                    answers[uuids[i*FLAGS.batch_size+j]] = rev_vocab[passage[a_s[j]]]
+                else:
+                    answers[uuids[i*FLAGS.batch_size+j]] = ' '.join([rev_vocab[passage[k]] for k in range(a_s[j], a_e[j] + 1)])
 
     return answers
 
@@ -156,6 +211,7 @@ def main(_):
     vocab, rev_vocab = initialize_vocab(FLAGS.vocab_path)
 
     embed_path = FLAGS.embed_path or pjoin("data", "squad", "glove.trimmed.{}.npz".format(FLAGS.embedding_size))
+    embed = np.load(embed_path)['glove'].astype(np.float32)
 
     if not os.path.exists(FLAGS.log_dir):
         os.makedirs(FLAGS.log_dir)
@@ -169,10 +225,12 @@ def main(_):
     # ========= Load Dataset =========
     # You can change this code to load dataset in your own way
 
+    dev_set = load_file('dev', vocab)
+
     dev_dirname = os.path.dirname(os.path.abspath(FLAGS.dev_path))
     dev_filename = os.path.basename(FLAGS.dev_path)
-    context_data, question_data, question_uuid_data = prepare_dev(dev_dirname, dev_filename, vocab)
-    dataset = (context_data, question_data, question_uuid_data)
+    _, __, uuids = prepare_dev(dev_dirname, dev_filename, vocab)
+
 
     # ========= Model-specific =========
     # You must change the following code to adjust to your model
@@ -180,12 +238,20 @@ def main(_):
     encoder = Encoder(size=FLAGS.state_size, vocab_dim=FLAGS.embedding_size)
     decoder = Decoder(output_size=FLAGS.output_size)
 
-    qa = QASystem(encoder, decoder)
+    qa = QASystem(encoder, decoder, embed, vocab)
+    qa.saver = tf.train.Saver()
+
 
     with tf.Session() as sess:
         train_dir = get_normalized_train_dir(FLAGS.train_dir)
         initialize_model(sess, qa, train_dir)
-        answers = generate_answers(sess, qa, dataset, rev_vocab)
+        answers = generate_answers(sess, qa, dev_set, rev_vocab, uuids)
+
+        '''
+        with open('dev-predictions.txt','w') as pres:
+            for i in range(len(answers)):
+                pres.write("%s\n" % answers[i])
+        '''
 
         # write to json file to root dir
         with io.open('dev-prediction.json', 'w', encoding='utf-8') as f:
