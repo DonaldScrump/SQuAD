@@ -16,6 +16,7 @@ import numpy as np
 from six.moves import xrange
 import tensorflow as tf
 
+
 from qa import Encoder, QASystem, Decoder
 from preprocessing.squad_preprocess import data_from_json, maybe_download, squad_base_url, \
     invert_map, tokenize, token_idx_map
@@ -35,7 +36,7 @@ tf.app.flags.DEFINE_integer("batch_size", 16, "Batch size to use during training
 tf.app.flags.DEFINE_integer("epochs", 0, "Number of epochs to train.")
 tf.app.flags.DEFINE_integer("state_size", 75, "Size of each model layer.")
 tf.app.flags.DEFINE_integer("embedding_size", 100, "Size of the pretrained vocabulary.")
-tf.app.flags.DEFINE_integer("output_size", 750, "The output size of your model.")
+tf.app.flags.DEFINE_integer("output_size", 500, "The output size of your model.")
 tf.app.flags.DEFINE_integer("keep", 0, "How many checkpoints to keep, 0 indicates keep all.")
 tf.app.flags.DEFINE_string("optimizer", "adad", "adam / sgd / adadelta")
 tf.app.flags.DEFINE_string("data_dir", "data/squad", "SQuAD directory (default ./data/squad)")
@@ -45,18 +46,16 @@ tf.app.flags.DEFINE_string("vocab_path", "data/squad/vocab.dat", "Path to vocab 
 tf.app.flags.DEFINE_string("embed_path", "", "Path to the trimmed GLoVe embedding (default: ./data/squad/glove.trimmed.{embedding_size}.npz)")
 tf.app.flags.DEFINE_string("dev_path", "download/squad/dev-v1.1.json", "Path to the JSON dev set to evaluate against (default: ./data/squad/dev-v1.1.json)")
 
-def initialize_model(session, model, train_dir):
+def initialize_model(session, saver, train_dir):
     ckpt = tf.train.get_checkpoint_state(train_dir)
     v2_path = ckpt.model_checkpoint_path + ".index" if ckpt else ""
     if ckpt and (tf.gfile.Exists(ckpt.model_checkpoint_path) or tf.gfile.Exists(v2_path)):
         logging.info("Reading model parameters from %s" % ckpt.model_checkpoint_path)
-        model.saver.restore(session, ckpt.model_checkpoint_path)
+        saver.restore(session, ckpt.model_checkpoint_path)
     else:
         logging.info("Created model with fresh parameters.")
         session.run(tf.global_variables_initializer())
         logging.info('Num params: %d' % sum(v.get_shape().num_elements() for v in tf.trainable_variables()))
-    return model
-
 
 def initialize_vocab(vocab_path):
     if tf.gfile.Exists(vocab_path):
@@ -69,36 +68,53 @@ def initialize_vocab(vocab_path):
     else:
         raise ValueError("Vocabulary file %s not found.", vocab_path)
 
-def load_file(set_id, vocab):
-    dataset = None
 
-    if tf.gfile.Exists(os.path.join(FLAGS.data_dir,set_id)+'.question'):
-        logging.info("Files found! Extracting input sentences...in data set: "+set_id)
-        start = time.time()
-        questions = []
-        contexts = []
-        answer_span = []
+def dev_minibatches(dataset, batch_size):
+    batches = []
+    data_size = len(dataset)
+    for i in np.arange(0,data_size,batch_size):
+        temp = dataset[i:i+batch_size]
+        if len(temp) is not batch_size:
+            temp.extend([([2,2],[0,2],[1,1])]*(batch_size-len(temp)))
 
-        file_prefix = os.path.join(FLAGS.data_dir,set_id)
-        with open(file_prefix+'.question') as fin:
-            questions.extend(fin.readlines())
-        questions = [re.split(' +|/',line.strip('\n')) for line in questions]
-        questions = [[vocab[word] if vocab.get(word) is not None else 2 for word in line] for line in questions]
+        _1 = [k[0] for k in temp]
+        _2 = [k[1] for k in temp]
+        # _4 = np.array([min(k[2][0],FLAGS.output_size-1) for k in temp])
+        # _5 = np.array([min(k[2][1],FLAGS.output_size-1) for k in temp])
 
-        with open(file_prefix+'.context') as fin:
-            contexts.extend(fin.readlines())
-        contexts = [re.split(' +|/',line.strip('\n'))[:FLAGS.output_size] for line in contexts]
-        contexts = [[vocab[word] if vocab.get(word) is not None else 2 for word in line] for line in contexts]
+        length1 = np.array([len(l) for l in _1])
+        length2 = np.array([len(l) for l in _2])
+        l1 = np.max([len(l) for l in _1])
+        l2 = np.max([len(l) for l in _2])
+        # _6 = np.array([[.0]*l2]*len(temp))
+        # _7 = np.array([[.0]*l2]*len(temp))
+        # _6[np.arange(len(temp)),_4] += 1.
+        # _7[np.arange(len(temp)),_5] += 1.
 
-        with open(file_prefix+'.span') as fin:
-            answer_span.extend(fin.readlines())
-        answer_span = [re.findall('\d+', line) for line in answer_span]
-        answer_span = np.array([[int(l) for l in line] for line in answer_span])
+        '''
+        l_1 = np.array([[False]*l1]*len(temp))
+        l_2 = np.array([[False]*l2]*len(temp))
+        l_1[np.arange(len(temp)),[len(k)-1 for k in _1]] |= True
+        l_2[np.arange(len(temp)),[len(k)-1 for k in _2]] |= True
+        '''
 
-        dataset = zip(questions,contexts,answer_span)
-        logging.info('Took %.2f seconds', time.time() - start)
+        mask1 = np.concatenate([np.append([1.]*len(w),[0.]*(l1-len(w))) for w in _1]).reshape(-1,l1)
+        mask2 = np.concatenate([np.append([1.]*len(w),[0.]*(l2-len(w))) for w in _2]).reshape(-1,l2)
+        _1 = np.concatenate([np.append(w,[0]*l1)[:l1] for w in _1]).reshape(-1,l1) # also pad at the end
+        _2 = np.concatenate([np.append(w,[0]*l2)[:l2] for w in _2]).reshape(-1,l2)
 
-    return dataset
+        batches.append({'q':_1,             'qm':mask1,
+                        'c':_2,             'cm':mask2, # questions, contexts and their masks
+                        # 'answer_start_m'    :_6, # span start mask
+                        # 'answer_end_m'      :_7, # span end mask
+                        # 'answer_start_i'    :_4, # span start index
+                        # 'answer_end_i'      :_5, # span end index
+                        # 'q_end_m'           :l_1, # question end mask
+                        # 'c_end_m'           :l_2, # context end mask
+                        'ql'                :length1, # question lengths
+                        'cl'                :length2}) # context lengths
+
+    return batches
 
 
 def read_dataset(dataset, tier, vocab):
@@ -147,7 +163,7 @@ def prepare_dev(prefix, dev_filename, vocab):
     return context_data, question_data, question_uuid_data
 
 
-def generate_answers(sess, model, dataset, rev_vocab, uuids):
+def generate_answers(sess, model, dev_batches, rev_vocab, uuids):
     """
     Loop over the dev or test dataset and generate answer.
 
@@ -167,21 +183,25 @@ def generate_answers(sess, model, dataset, rev_vocab, uuids):
     :return:
     """
     answers = {}
-    dev_batches = model.minibatches(dataset, FLAGS.batch_size)
-    for i in range(len(dev_batches)):
+    for i, b in enumerate(dev_batches):
+
+        a_s, a_e = model.answer(sess, b)
         if i%100 == 0:
-            print(i)
-        a_s, a_e = model.answer(sess, dev_batches[i])
+            print('%d batches processed so far...'% i)
+
         if i != len(dev_batches)-1:
-            for j in range(len(dev_batches[i])):
-                passage = dev_batches[i]['c'][j,:]
+            for j in range(FLAGS.batch_size):
+                passage = b['c'][j,:]
                 if a_s[j]>a_e[j]:
                     answers[uuids[i*FLAGS.batch_size+j]] = rev_vocab[passage[a_s[j]]]
                 else:
                     answers[uuids[i*FLAGS.batch_size+j]] = ' '.join([rev_vocab[passage[k]] for k in range(a_s[j], a_e[j] + 1)])
         else:
-            for j in range(((len(dataset)-1)%FLAGS.batch_size)+1):
-                passage = dev_batches[i]['c'][j, :]
+            for j in range(FLAGS.batch_size):
+                passage = b['c'][j, :]
+                if i*FLAGS.batch_size+j >= len(uuids): # the last batch is currently padded
+                    break
+
                 if a_s[j] > a_e[j]:
                     answers[uuids[i*FLAGS.batch_size+j]] = rev_vocab[passage[a_s[j]]]
                 else:
@@ -226,11 +246,16 @@ def main(_):
     # You can change this code to load dataset in your own way
     # Use the uuids generated by the original file reader
 
-    dev_set = load_file('dev', vocab)
-
     dev_dirname = os.path.dirname(os.path.abspath(FLAGS.dev_path))
     dev_filename = os.path.basename(FLAGS.dev_path)
-    _, __, uuids = prepare_dev(dev_dirname, dev_filename, vocab)
+    contexts, questions, uuids = prepare_dev(dev_dirname, dev_filename, vocab)
+
+    contexts = [re.findall('\d+',sen1) for sen1 in contexts]
+    contexts = np.array([[int(l) for l in j] for j in contexts])
+    questions = [re.findall('\d+',sen2) for sen2 in questions]
+    questions = np.array([[int(l) for l in j] for j in questions])
+
+    dev_set = dev_minibatches(zip(questions, contexts), FLAGS.batch_size)
 
 
     # ========= Model-specific =========
@@ -239,13 +264,16 @@ def main(_):
     encoder = Encoder(size=FLAGS.state_size, vocab_dim=FLAGS.embedding_size)
     decoder = Decoder(output_size=FLAGS.output_size)
 
-    qa = QASystem(encoder, decoder, embed, vocab)
-    qa.saver = tf.train.Saver()
+    qa = QASystem(encoder, decoder, embed, tf.train.AdadeltaOptimizer(learning_rate=FLAGS.learning_rate,epsilon=1e-6))
+    saver = tf.train.Saver()
 
 
-    with tf.Session() as sess:
+    config = tf.ConfigProto(allow_soft_placement=True, log_device_placement=False)
+    config.gpu_options.visible_device_list='3,5'
+
+    with tf.Session(config=config) as sess:
         train_dir = get_normalized_train_dir(FLAGS.train_dir)
-        initialize_model(sess, qa, train_dir)
+        initialize_model(sess, saver, train_dir)
         answers = generate_answers(sess, qa, dev_set, rev_vocab, uuids)
 
         '''
