@@ -266,6 +266,8 @@ def main(_):
 
                 prog.update(i/ARGS.gpus + 1, [("train loss", loss_temp)])
 
+            qa[0].evaluate_answer(sess,dev_set,20,True) # a rough estimate over the dev set after each epoch
+
             logging.info("Saving current parameters...")
             saver.save(sess, os.path.join(save_train_dir, 'model.weights'))
 

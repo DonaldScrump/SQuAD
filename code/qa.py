@@ -266,17 +266,17 @@ class QASystem(object):
             return out, out
 
 
-    def bidirectional_masked_dynamic_rnn_output(self, cell_fw, cell_bw, inputs, dtype, length, mask, scope=None):
+    def bidirectional_masked_dynamic_rnn_output(self, cell_fw, cell_bw, inputs, dtype, lengths, mask, scope=None):
         scope = scope or type(self).__name__
 
         with tf.variable_scope(scope):
             with tf.variable_scope('fw'):
-                fw_out, fw_state = tf.nn.dynamic_rnn(cell = cell_fw, inputs = inputs, dtype = dtype)
+                fw_out, __ = tf.nn.dynamic_rnn(cell = cell_fw, inputs = inputs, dtype = dtype)
             with tf.variable_scope('bw'):
-                bw_out, bw_state = tf.nn.dynamic_rnn(cell = cell_bw, inputs = tf.reverse_sequence(inputs, length,
+                bw_out, __ = tf.nn.dynamic_rnn(cell = cell_bw, inputs = tf.reverse_sequence(inputs, lengths,
                             seq_axis=1, batch_axis=0), dtype = dtype)
 
-            out = tf.concat([fw_out, tf.reverse_sequence(bw_out,length,seq_axis=1,batch_axis=0)],axis=2)*mask
+            out = tf.concat([fw_out, tf.reverse_sequence(bw_out,lengths,seq_axis=1,batch_axis=0)],axis=2)*mask
 
         return out
 
