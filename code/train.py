@@ -250,6 +250,8 @@ def main(_):
         save_train_dir = get_normalized_train_dir(FLAGS.train_dir)
 
         batches = minibatches(train_set, FLAGS.batch_size)
+        dev_batches = minibatches(dev_set, FLAGS.batch_size)
+
         for _ in range(FLAGS.epochs):
             logging.info("Epoch %d out of %d", _+1, FLAGS.epochs)
             prog = Progbar(target=len(np.arange(0,len(batches),ARGS.gpus)))
@@ -266,7 +268,10 @@ def main(_):
 
                 prog.update(i/ARGS.gpus + 1, [("train loss", loss_temp)])
 
-            qa[0].evaluate_answer(sess,dev_set,20,True) # a rough estimate over the dev set after each epoch
+            try:
+                qa[0].evaluate_answer(sess,dev_batches,20,True) # a rough estimate over the dev set after each epoch
+            except:
+                logging.info('An error occured when validating...')
 
             logging.info("Saving current parameters...")
             saver.save(sess, os.path.join(save_train_dir, 'model.weights'))
